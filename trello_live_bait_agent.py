@@ -1,8 +1,13 @@
 # trello_live_bait_agent.py
 # Reads the single .xlsx in ./input, routes each row to Men/Women boards by gender,
-# skips duplicates by Name across BOTH boards, and creates a card with:
+# skips duplicates by ID (from Timestamp, stored in description as "ID: <unix>") across BOTH boards,
+# and (in non-dry-run) creates a card with:
 # - IG formatted as clickable Instagram link(s)
 # - Phone included (auto-detected phone column)
+# - Submission date from Timestamp (formatted M/D/YYYY in America/Chicago)
+# - ID as unix timestamp seconds in America/Chicago
+#
+# DRY_RUN is ON: it will NOT create cards, it will only print what it would do.
 
 import os
 import time
@@ -10,6 +15,7 @@ import glob
 import re
 import requests
 import pandas as pd
+from zoneinfo import ZoneInfo
 
 API_BASE = "https://api.trello.com/1"
 
@@ -19,6 +25,8 @@ TARGET_LIST_NAME = "Applicants"
 
 INPUT_DIR = "input"
 
+DRY_RUN = False
+CENTRAL_TZ = ZoneInfo("America/Chicago")
 
 # Excel column names (known)
 COL_NAME = "Name"
@@ -28,6 +36,7 @@ COL_ABOUT = "What's your vibe?\n\nExample: â€œA golden retriever in human formâ€
 COL_LOOKING = "What kind of person are you looking for?"
 COL_WHY = "Why do you want to be on Live Bait?"
 COL_GENDER = "Guy or Girl?"
+COL_TIMESTAMP = "Timestamp"
 
 # Phone column is often named differently, we auto-detect it.
 PHONE_COL_HINTS = [
@@ -65,13 +74,13 @@ def trello_post(path, params):
         return r.json()
 
 
-def norm_name(s: str) -> str:
-    return " ".join(str(s).strip().lower().split())
-
-
 def safe_str(x) -> str:
-    if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
-        return ""
+    try:
+        if x is None or pd.isna(x):
+            return ""
+    except Exception:
+        if x is None:
+            return ""
     return str(x).strip()
 
 
@@ -162,6 +171,36 @@ def ig_markdown(raw_ig: str) -> str:
     return ", ".join([f"[@{h}](https://www.instagram.com/{h})" for h in handles])
 
 
+def timestamp_to_submission_and_id(ts_value):
+    """
+    Uses the Excel Timestamp field.
+    Converts to America/Chicago.
+    Returns (submission_date_str, unix_seconds_id)
+
+    submission_date_str format: M/D/YYYY (no leading zeros)
+    """
+    if ts_value is None:
+        return None, None
+    try:
+        if pd.isna(ts_value):
+            return None, None
+    except Exception:
+        pass
+
+    dt = pd.to_datetime(ts_value)
+
+    # If tz-naive, interpret it as Central time already.
+    # If tz-aware, convert to Central.
+    if getattr(dt, "tzinfo", None) is None:
+        dt = dt.to_pydatetime().replace(tzinfo=CENTRAL_TZ)
+    else:
+        dt = dt.to_pydatetime().astimezone(CENTRAL_TZ)
+
+    submission_date_str = f"{dt.month}/{dt.day}/{dt.year}"
+    unix_seconds_id = int(dt.timestamp())
+    return submission_date_str, unix_seconds_id
+
+
 def build_desc(row, phone_col: str | None) -> str:
     name = safe_str(row.get(COL_NAME))
     ig = ig_markdown(row.get(COL_IG))
@@ -171,7 +210,8 @@ def build_desc(row, phone_col: str | None) -> str:
     why = safe_str(row.get(COL_WHY))
     phone = safe_str(row.get(phone_col)) if phone_col else ""
 
-    # Phone line included even if blank, so template stays consistent
+    submission_date_str, unix_id = timestamp_to_submission_and_id(row.get(COL_TIMESTAMP))
+
     return (
         f"Name: {name}\n"
         f"IG: {ig}\n"
@@ -180,6 +220,8 @@ def build_desc(row, phone_col: str | None) -> str:
         f"About: {about}\n"
         f"Looking for: {looking}\n"
         f"Why: {why}\n"
+        f"Submission date: {submission_date_str if submission_date_str else ''}\n"
+        f"ID: {unix_id if unix_id is not None else ''}\n"
     )
 
 
@@ -195,18 +237,38 @@ def get_list_id_by_name(board_id: str, list_name: str, auth: dict) -> str:
     raise SystemExit(f'Could not find a list named "{list_name}" on board {board_id}')
 
 
-def get_all_card_names(board_id: str, auth: dict) -> dict:
+def extract_id_from_desc(desc: str) -> int | None:
     """
-    Returns dict: normalized_name -> list of (card_name, card_id, board_id)
+    Finds the first ID line in the description:
+      ID: 123456
+    Returns int or None.
     """
-    cards = trello_get(f"/boards/{board_id}/cards", {**auth, "fields": "name"})
-    out: dict[str, list[tuple[str, str, str]]] = {}
+    if not desc:
+        return None
+    m = re.search(r"^ID:\s*(\d+)\s*$", desc, re.MULTILINE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def get_all_ids(board_id: str, auth: dict) -> dict[int, list[tuple[str, str, str]]]:
+    """
+    Returns dict: id_int -> list of (card_name, card_id, board_id)
+    Pulls card desc to find IDs.
+    """
+    cards = trello_get(f"/boards/{board_id}/cards", {**auth, "fields": "name,desc"})
+    out: dict[int, list[tuple[str, str, str]]] = {}
     for c in cards:
         nm = safe_str(c.get("name"))
-        if not nm:
+        cid = safe_str(c.get("id"))
+        desc = c.get("desc") or ""
+        found_id = extract_id_from_desc(desc)
+        if found_id is None:
             continue
-        key = norm_name(nm)
-        out.setdefault(key, []).append((nm, safe_str(c.get("id")), board_id))
+        out.setdefault(found_id, []).append((nm, cid, board_id))
     return out
 
 
@@ -225,8 +287,8 @@ def main():
     excel_path = excel_files[0]
     df = pd.read_excel(excel_path)
 
-    # Validate required columns
-    for required in [COL_NAME, COL_GENDER]:
+    # Validate required columns (Name is needed to create card name; Gender routes; Timestamp generates ID)
+    for required in [COL_NAME, COL_GENDER, COL_TIMESTAMP]:
         if required not in df.columns:
             raise SystemExit(f"Missing required column: {required}")
 
@@ -242,28 +304,30 @@ def main():
     men_list_id = get_list_id_by_name(men_board_id, TARGET_LIST_NAME, auth)
     women_list_id = get_list_id_by_name(women_board_id, TARGET_LIST_NAME, auth)
 
-    # Global duplicate map across both boards
-    men_names = get_all_card_names(men_board_id, auth)
-    women_names = get_all_card_names(women_board_id, auth)
+    # Global duplicate map across both boards (by ID in description ONLY)
+    print("Scanning existing card descriptions for IDs on Men board")
+    men_ids = get_all_ids(men_board_id, auth)
 
-    global_names: dict[str, list[tuple[str, str, str]]] = {}
-    for d in [men_names, women_names]:
+    print("Scanning existing card descriptions for IDs on Women board")
+    women_ids = get_all_ids(women_board_id, auth)
+
+    global_ids: dict[int, list[tuple[str, str, str]]] = {}
+    for d in [men_ids, women_ids]:
         for k, v in d.items():
-            global_names.setdefault(k, []).extend(v)
+            global_ids.setdefault(k, []).extend(v)
 
     created = 0
-    skipped_duplicates: list[tuple[str, list[str]]] = []
+    dryrun_would_create = 0
+
+    skipped_duplicates_by_id: list[tuple[str, int, list[str]]] = []
     skipped_bad_rows: list[tuple[int, str]] = []
     errors: list[tuple[str, str]] = []
 
     for i, row in df.iterrows():
-        raw_name = row.get(COL_NAME, "")
-        name = safe_str(raw_name)
+        name = safe_str(row.get(COL_NAME, ""))
         if not name:
             skipped_bad_rows.append((i, "Missing name"))
             continue
-
-        name_key = norm_name(name)
 
         raw_gender = row.get(COL_GENDER, "")
         gender = safe_str(raw_gender).lower()
@@ -271,16 +335,38 @@ def main():
             skipped_bad_rows.append((i, f'Invalid gender "{raw_gender}"'))
             continue
 
-        # Duplicate check across both boards
-        if name_key in global_names:
-            found = global_names[name_key]
-            found_locations = [f"board_id={b_id}, card_name={card_name}" for (card_name, _cid, b_id) in found]
-            skipped_duplicates.append((name, found_locations))
+        submission_date_str, unix_id = timestamp_to_submission_and_id(row.get(COL_TIMESTAMP))
+        if submission_date_str is None or unix_id is None:
+            skipped_bad_rows.append((i, "Missing or invalid Timestamp"))
+            continue
+
+        # Duplicate check across both boards by ID ONLY
+        if unix_id in global_ids:
+            found = global_ids[unix_id]
+            found_locations = [
+                f"board_id={b_id}, card_name={card_name}, card_id={cid}"
+                for (card_name, cid, b_id) in found
+            ]
+            skipped_duplicates_by_id.append((name, unix_id, found_locations))
             continue
 
         desc = build_desc(row, phone_col)
         target_list_id = men_list_id if gender == "guy" else women_list_id
         target_board_id = men_board_id if gender == "guy" else women_board_id
+
+        if DRY_RUN:
+            dryrun_would_create += 1
+            print("\n[DRY RUN] Would create card")
+            print(f"  Name: {name}")
+            print(f"  Gender: {gender}")
+            print(f"  Board ID: {target_board_id}")
+            print(f"  List ID: {target_list_id}")
+            print(f"  Submission date: {submission_date_str}")
+            print(f"  ID: {unix_id}")
+
+            # Update in-memory IDs so we also catch duplicates within the same run
+            global_ids.setdefault(unix_id, []).append((name, "", target_board_id))
+            continue
 
         try:
             trello_post(
@@ -293,17 +379,22 @@ def main():
                 },
             )
             created += 1
-            global_names[name_key] = [(name, "", target_board_id)]
+
+            # Track created ID in-memory
+            global_ids.setdefault(unix_id, []).append((name, "", target_board_id))
         except Exception as e:
             errors.append((name, str(e)))
 
     print("\nDone.")
+    print(f"Dry run: {DRY_RUN}")
+    print(f"Would create: {dryrun_would_create}")
     print(f"Created: {created}")
-    print(f"Skipped duplicates: {len(skipped_duplicates)}")
-    if skipped_duplicates:
-        print("Duplicate names found (skipped):")
-        for nm, locs in skipped_duplicates:
-            print(f"  - {nm}")
+
+    print(f"Skipped duplicates by ID: {len(skipped_duplicates_by_id)}")
+    if skipped_duplicates_by_id:
+        print("Duplicate IDs found (skipped):")
+        for nm, uid, locs in skipped_duplicates_by_id:
+            print(f"  - {nm} (ID: {uid})")
             for loc in locs:
                 print(f"      {loc}")
 
@@ -311,7 +402,6 @@ def main():
     if skipped_bad_rows:
         print("Bad rows (skipped):")
         for idx, reason in skipped_bad_rows:
-            # +2 accounts for header row plus 0-index
             print(f"  - Row {idx + 2}: {reason}")
 
     print(f"Errors: {len(errors)}")
