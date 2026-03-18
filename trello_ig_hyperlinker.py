@@ -16,6 +16,32 @@ WOMEN_BOARD_SHORTLINK = "HdHx0FLI"
 # Set to True to preview changes without writing to Trello
 DRY_RUN = False
 
+def load_env_file(path=".env"):
+    """
+    Load KEY=VALUE pairs from a .env file into os.environ
+    without overwriting variables already set in the shell.
+    """
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+
+            if key not in os.environ:
+                os.environ[key] = value
+
+load_env_file()
 
 def trello_get(path, params):
     url = f"{API_BASE}{path}"
